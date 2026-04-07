@@ -153,8 +153,9 @@ def background_lightning_collector():
                                     data_line = line[6:]
                                     break
                             if not data_line:
-                                continue                            data = json.loads(data_line)
-
+                                continue                            
+                            data = json.loads(data_line)
+                            
                             if data and "lightning" in data:
                                 now_ts = time.time()
                                 with lock:
