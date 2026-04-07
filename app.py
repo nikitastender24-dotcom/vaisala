@@ -24,17 +24,18 @@ CLEAR_INTERVAL = 1200  # 20 минут
 lightning_archive = {}
 lock = Lock()
 collector_running = False
-last_update_time = 0  # Когда последний раз обновлялись данные
+last_update_time = 0
 
 def clean_old():
     """Удаляет точки старше 2 часов"""
     with lock:
         now = time.time()
+        initial_count = len(lightning_archive)
         to_del = [k for k, v in lightning_archive.items() if now - v['time'] > MAX_AGE_SECONDS]
         for k in to_del:
             del lightning_archive[k]
         if to_del:
-            print(f"🧹 Удалено {len(to_del)} старых точек (>2ч)")
+            print(f"🧹 Удалено {len(to_del)} старых точек (было {initial_count}, осталось {len(lightning_archive)})")
 
 def check_limit():
     """Если точек больше MAX_POINTS — удаляем самые старые"""
@@ -77,14 +78,14 @@ def background_lightning_collector():
     collector_running = True
     
     print("=" * 70)
-    print("🔥 ФОНОВЫЙ СБОРЩИК МОЛНИЙ ЗАПУЩЕН (работает постоянно)")
+    print("🔥 ФОНОВЫЙ СБОРЩИК МОЛНИЙ ЗАПУЩЕН")
     print("=" * 70)
     
     reconnect_delay = 5
     
     while collector_running:
         try:
-            print(f"\n📡 Подключение к источнику данных...")
+            print(f"\n📡 Подключение к {SOURCE_URL}...")
             
             resp = requests.get(SOURCE_URL, stream=True, timeout=60)
             
@@ -94,11 +95,12 @@ def background_lightning_collector():
                 continue
             
             print("✅ ПОДКЛЮЧЕНО К ИСТОЧНИКУ!")
-            print(f"📊 Текущий архив в RAM: {len(lightning_archive)} разрядов")
+            print(f"📊 Текущий архив: {len(lightning_archive)} разрядов")
             
             buffer = ""
             last_clean = time.time()
             last_heartbeat = time.time()
+            events_received = 0
             
             for chunk in resp.iter_content(chunk_size=1024, decode_unicode=True):
                 if not chunk or not collector_running:
@@ -107,13 +109,14 @@ def background_lightning_collector():
                 buffer += chunk
                 now = time.time()
                 
-                # Heartbeat каждые 60 секунд
-                if now - last_heartbeat > 60:
-                    print(f"💓 Соединение активно | В RAM: {len(lightning_archive)} точек")
+                # Heartbeat каждые 30 секунд
+                if now - last_heartbeat > 30:
+                    print(f"💓 Активно | События: {events_received} | RAM: {len(lightning_archive)} точек")
                     last_heartbeat = now
                 
                 while '\n\n' in buffer:
                     event, buffer = buffer.split('\n\n', 1)
+                    events_received += 1
                     
                     if 'lightning-vaisala' in event:
                         try:
@@ -135,10 +138,12 @@ def background_lightning_collector():
                                 now_ts = time.time()
                                 new_strikes = 0
                                 
+                                print(f"📥 Получено событие с {len(strikes)} разрядами")
+                                
                                 with lock:
                                     for s in strikes:
-                                        if len(s) >= 2:
-                                            lat, lng = s[0], s[1]
+                                        if isinstance(s, list) and len(s) >= 2:
+                                            lat, lng = float(s[0]), float(s[1])
                                             key = (lat, lng)
                                             
                                             if key not in lightning_archive:
@@ -151,13 +156,12 @@ def background_lightning_collector():
                                             }
                                     
                                     check_limit()
-                                    last_update_time = now_ts  # Обновляем время последнего обновления
+                                    last_update_time = now_ts
                                 
-                                if new_strikes > 0:
-                                    print(f"⚡ +{new_strikes} новых | Всего в RAM: {len(lightning_archive)}")
+                                print(f"⚡ Добавлено {new_strikes} новых | Всего в RAM: {len(lightning_archive)}")
                                     
                         except Exception as e:
-                            pass  # Игнорируем ошибки парсинга
+                            print(f"❌ Ошибка парсинга: {e}")
                     
                 # Очистка старых каждые 60 секунд
                 if now - last_clean > 60:
@@ -166,6 +170,8 @@ def background_lightning_collector():
                         
         except Exception as e:
             print(f"❌ Ошибка подключения: {e}")
+            import traceback
+            traceback.print_exc()
             time.sleep(reconnect_delay)
 
 # ========== РОУТЫ ==========
@@ -242,6 +248,19 @@ def serve_map():
         }
 
         .leaflet-lightning-layer { pointer-events: none; }
+        
+        .debug {
+            position: absolute;
+            top: 100px;
+            right: 20px;
+            background: rgba(0,0,0,0.8);
+            padding: 10px;
+            border-radius: 8px;
+            color: #0f0;
+            z-index: 1000;
+            font-size: 10px;
+            max-width: 300px;
+        }
     </style>
 </head>
 <body>
@@ -251,6 +270,11 @@ def serve_map():
         <div>⚡ ГРОЗЫ (все плюсики)</div>
         <div class="count" id="strikeCount">—</div>
         <div id="statusText">Загрузка...</div>
+    </div>
+    
+    <div class="debug" id="debug">
+        <div>Отладка:</div>
+        <div id="debugText">Инициализация...</div>
     </div>
 
     <div class="legend">
@@ -270,6 +294,14 @@ def serve_map():
 
     <script>
         const PROXY_URL = window.location.origin;
+        
+        function debug(msg) {
+            console.log('[DEBUG]', msg);
+            const el = document.getElementById('debugText');
+            if (el) {
+                el.innerHTML = msg + '<br>' + el.innerHTML.split('<br>').slice(0, 5).join('<br>');
+            }
+        }
 
         const map = L.map('map', {
             preferCanvas: true,
@@ -281,6 +313,8 @@ def serve_map():
             subdomains: 'abcd',
             maxZoom: 19
         }).addTo(map);
+        
+        debug('Карта создана');
 
         const strikeStore = new Map();
 
@@ -372,12 +406,18 @@ def serve_map():
 
         const lightningLayer = new LightningCanvasLayer();
         lightningLayer.addTo(map);
+        
+        debug('Canvas слой добавлен');
 
         async function reloadArchive() {
             try {
                 document.getElementById('statusText').innerText = 'Обновление...';
+                debug('Запрос к /api/archive...');
+                
                 const resp = await fetch(PROXY_URL + '/api/archive');
                 const data = await resp.json();
+                
+                debug(`Получено: ${data.count} точек`);
 
                 strikeStore.clear();
                 for (const s of data.strikes) {
@@ -393,8 +433,11 @@ def serve_map():
                 document.getElementById('strikeCount').textContent = strikeStore.size;
                 document.getElementById('statusText').textContent = `Обновлено: ${new Date().toLocaleTimeString()}`;
                 lightningLayer.redraw();
+                
+                debug(`Отрисовано: ${strikeStore.size} точек`);
             } catch (err) {
                 console.error('❌ Ошибка:', err);
+                debug('ОШИБКА: ' + err.message);
                 document.getElementById('statusText').textContent = '❌ Ошибка';
             }
         }
@@ -404,12 +447,13 @@ def serve_map():
             lightningLayer.redraw();
             document.getElementById('strikeCount').textContent = '0';
             document.getElementById('statusText').textContent = 'Сброс выполнен';
+            debug('Сброс выполнен');
         }
 
         document.getElementById('refreshBtn').onclick = reloadArchive;
         document.getElementById('clearBtn').onclick = clearAllMarkers;
 
-        // ГЛАВНОЕ: Обновляем данные каждые 10 секунд (просто читаем из /api/archive)
+        // Обновляем каждые 10 секунд
         setInterval(reloadArchive, 10000);
 
         window.addEventListener('resize', () => {
@@ -417,9 +461,10 @@ def serve_map():
             lightningLayer._reset();
         });
 
+        debug('Запуск первой загрузки...');
         reloadArchive();
         
-        console.log('🚀 Карта запущена, автообновление каждые 10 сек');
+        console.log('🚀 Карта запущена, API:', PROXY_URL);
     </script>
 </body>
 </html>"""
@@ -428,6 +473,8 @@ def serve_map():
 @app.route('/api/archive')
 def get_archive():
     """Пользователи просто читают данные из RAM"""
+    print(f"📤 API запрос /api/archive | В памяти: {len(lightning_archive)} точек")
+    
     with lock:
         now = time.time()
         strikes = []
@@ -459,12 +506,15 @@ def get_archive():
                 'age_min': round(age_min, 1)
             })
     
+    print(f"📤 Отправлено клиенту: {len(strikes)} точек")
     return jsonify({'strikes': strikes, 'count': len(strikes)})
 
 @app.route('/api/clear', methods=['POST'])
 def clear_archive():
     with lock:
+        count = len(lightning_archive)
         lightning_archive.clear()
+    print(f"🗑️ API очистка: удалено {count} точек")
     return jsonify({'status': 'cleared', 'count': 0})
 
 @app.route('/api/stats')
@@ -510,7 +560,6 @@ def health():
 
 # ========== ИНИЦИАЛИЗАЦИЯ ==========
 
-# Запуск фоновых потоков
 clear_thread = Thread(target=periodic_clear, daemon=True)
 clear_thread.start()
 
@@ -519,9 +568,8 @@ collector_thread.start()
 
 print("\n" + "=" * 70)
 print("⚡ LIGHTNING ARCHIVE API")
-print("📊 Фоновый сборщик работает ВСЕГДА (независимо от пользователей)")
-print("🗑️ Автоочистка каждые 20 минут")
-print("👥 Пользователи читают данные из RAM через /api/archive")
+print("📊 Фоновый сборщик: ЗАПУЩЕН")
+print("🗑️ Автоочистка каждые 20 минут: АКТИВНА")
 print("=" * 70 + "\n")
 
 if __name__ == '__main__':
