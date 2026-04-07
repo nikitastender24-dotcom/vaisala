@@ -21,7 +21,7 @@ SOURCE_URL = "https://tiles.wo-cloud.com/live?channels=lightning-nowcast,lightni
 ARCHIVE_FILE = "lightning_archive.json"
 MAX_AGE_SECONDS = 7200
 MAX_POINTS = 80000
-DELETE_FILE_INTERVAL = 1200  # 20 минут
+DELETE_FILE_INTERVAL = 3600  # 1 час
 
 lightning_archive = {}
 lock = Lock()
