@@ -5,10 +5,10 @@ import json
 import time
 import os
 from threading import Lock, Thread
-from queue import Queue
 
 app = Flask(__name__)
 
+# Настройка CORS для доступа с любых доменов
 CORS(app, resources={
     r"/*": {
         "origins": "*",
@@ -19,17 +19,13 @@ CORS(app, resources={
 
 SOURCE_URL = "https://tiles.wo-cloud.com/live?channels=lightning-nowcast,lightning-vaisala"
 ARCHIVE_FILE = "lightning_archive.json"
-MAX_AGE_SECONDS = 3600  # 1 час
+MAX_AGE_SECONDS = 7200
 MAX_POINTS = 80000
-DELETE_FILE_INTERVAL = 1200  # 20 минут
-SAVE_INTERVAL = 30
+DELETE_FILE_INTERVAL = 3600  # 1 час
 
 lightning_archive = {}
 lock = Lock()
 collector_running = False
-
-# Очередь для отправки новых меток всем SSE-клиентам
-new_strikes_queue = Queue()
 
 def load_archive():
     global lightning_archive
@@ -49,8 +45,7 @@ def load_archive():
 
 def save_archive():
     try:
-        with lock:
-            out = {f"{lat},{lng}": v for (lat, lng), v in lightning_archive.items()}
+        out = {f"{lat},{lng}": v for (lat, lng), v in lightning_archive.items()}
         with open(ARCHIVE_FILE, 'w') as f:
             json.dump(out, f)
     except Exception as e:
@@ -65,36 +60,22 @@ def delete_archive_file():
         print(f"❌ Ошибка удаления файла: {e}")
 
 def periodic_file_deletion():
-    """Полная очистка каждые 20 минут"""
     while True:
         time.sleep(DELETE_FILE_INTERVAL)
         with lock:
-            count = len(lightning_archive)
             delete_archive_file()
             lightning_archive.clear()
-            print(f"🔄 Полная очистка: удалено {count} разрядов (каждые {DELETE_FILE_INTERVAL // 60} мин)")
-
-def periodic_save():
-    """Периодическое сохранение в файл"""
-    while True:
-        time.sleep(SAVE_INTERVAL)
-        save_archive()
-        print(f"💾 Автосохранение: {len(lightning_archive)} точек")
+            print(f"🔄 Архив очищен (каждые {DELETE_FILE_INTERVAL // 60} минут)")
 
 def clean_old():
-    """Удаляет точки старше 1 часа"""
     with lock:
         now = time.time()
-        initial_count = len(lightning_archive)
         to_del = [k for k, v in lightning_archive.items() if now - v['time'] > MAX_AGE_SECONDS]
         for k in to_del:
             del lightning_archive[k]
-        if to_del:
-            print(f"🧹 Удалено {len(to_del)} старых точек >1ч (было {initial_count}, осталось {len(lightning_archive)})")
         check_limit()
 
 def check_limit():
-    """Если точек больше MAX_POINTS — удаляем самые старые"""
     global lightning_archive
     deleted = 0
     while len(lightning_archive) > MAX_POINTS:
@@ -112,15 +93,8 @@ def check_limit():
             deleted += 1
         else:
             break
-    
-    if deleted > 0:
-        print(f"⚠️ Удалено по лимиту: {deleted} точек")
 
 def background_lightning_collector():
-    """
-    ЕДИНСТВЕННЫЙ сборщик — работает постоянно в фоне.
-    Собирает данные и отправляет их в очередь для SSE-клиентов.
-    """
     global collector_running
     collector_running = True
     
@@ -145,6 +119,7 @@ def background_lightning_collector():
             print(f"📊 Текущий архив: {len(lightning_archive)} разрядов")
             
             buffer = ""
+            last_save = time.time()
             last_clean = time.time()
             last_heartbeat = time.time()
             
@@ -180,55 +155,42 @@ def background_lightning_collector():
                             if data and 'lightning' in data:
                                 strikes = data['lightning']
                                 now_ts = time.time()
-                                new_strikes = []
+                                new_strikes = 0
                                 
                                 with lock:
                                     for s in strikes:
-                                        if isinstance(s, list) and len(s) >= 2:
-                                            lat, lng = float(s[0]), float(s[1])
+                                        if len(s) >= 2:
+                                            lat, lng = s[0], s[1]
                                             key = (lat, lng)
                                             
-                                            is_new = key not in lightning_archive
+                                            if key not in lightning_archive:
+                                                new_strikes += 1
                                             
                                             lightning_archive[key] = {
                                                 'time': now_ts,
                                                 'lat': lat,
                                                 'lng': lng
                                             }
-                                            
-                                            if is_new:
-                                                new_strikes.append([lat, lng])
                                     
                                     check_limit()
                                 
-                                if new_strikes:
-                                    print(f"⚡ +{len(new_strikes)} | Всего: {len(lightning_archive)}")
-                                    # Отправляем новые метки всем SSE-клиентам
-                                    new_strikes_queue.put({'lightning': new_strikes})
+                                if new_strikes > 0:
+                                    print(f"⚡ +{new_strikes} | Всего: {len(lightning_archive)}")
+                                
+                                if now_ts - last_save > 10:
+                                    save_archive()
+                                    last_save = now_ts
                                     
                         except Exception as e:
-                            pass
+                            print(f"❌ Ошибка обработки: {e}")
                     
-                # Очистка старых каждые 60 секунд
-                if now - last_clean > 60:
-                    clean_old()
-                    last_clean = now
+                    if now - last_clean > 60:
+                        clean_old()
+                        last_clean = now
                         
         except Exception as e:
             print(f"❌ Ошибка: {e}")
             time.sleep(reconnect_delay)
-
-def fake_user_keepalive():
-    """Keepalive бот"""
-    print("🤖 Keepalive бот запущен")
-    while True:
-        try:
-            time.sleep(300)  # 5 минут
-            with lock:
-                count = len(lightning_archive)
-            print(f"🤖 Keepalive: в памяти {count} точек")
-        except Exception as e:
-            print(f"❌ Ошибка keepalive: {e}")
 
 # ========== РОУТЫ ==========
 
@@ -310,7 +272,7 @@ def serve_map():
     <div id="map"></div>
 
     <div class="info-panel">
-        <div>⚡ ГРОЗЫ (последний 1 час)</div>
+        <div>⚡ ГРОЗЫ (все плюсики)</div>
         <div class="count" id="strikeCount">—</div>
         <div id="statusText">Загрузка...</div>
     </div>
@@ -319,9 +281,10 @@ def serve_map():
         <div><span style="color:#fff">✚</span> 0-10мин</div>
         <div><span style="color:#ff0">✚</span> 10-20</div>
         <div><span style="color:#ffa500">✚</span> 20-30</div>
-        <div><span style="color:#ff4500">✚</span> 30-40</div>
-        <div><span style="color:#f00">✚</span> 40-50</div>
-        <div><span style="color:#8b0000">✚</span> 50-60</div>
+        <div><span style="color:#ff4500">✚</span> 30-50</div>
+        <div><span style="color:#f00">✚</span> 50-60</div>
+        <div><span style="color:#8b0000">✚</span> 60-90</div>
+        <div><span style="color:#4a0000">✚</span> 90-120</div>
     </div>
 
     <div class="controls">
@@ -460,34 +423,6 @@ def serve_map():
             }
         }
 
-        function addNewStrikes(newStrikes) {
-            if (!newStrikes || !newStrikes.length) return;
-
-            let added = 0;
-            for (const s of newStrikes) {
-                if (!Array.isArray(s) || s.length < 2) continue;
-
-                const lat = s[0];
-                const lng = s[1];
-                const key = `${lat.toFixed(4)},${lng.toFixed(4)}`;
-
-                if (!strikeStore.has(key)) {
-                    strikeStore.set(key, {
-                        lat,
-                        lng,
-                        color: '#ffffff',
-                        age_min: 0
-                    });
-                    added++;
-                }
-            }
-
-            if (added) {
-                document.getElementById('strikeCount').textContent = strikeStore.size;
-                lightningLayer.redraw();
-            }
-        }
-
         function clearAllMarkers() {
             strikeStore.clear();
             lightningLayer.redraw();
@@ -504,11 +439,21 @@ def serve_map():
                 try {
                     const data = JSON.parse(e.data);
                     if (data && data.lightning) {
-                        addNewStrikes(data.lightning);
+                        for (const s of data.lightning) {
+                            if (s.length >= 2) {
+                                const key = `${s[0].toFixed(4)},${s[1].toFixed(4)}`;
+                                strikeStore.set(key, {
+                                    lat: s[0],
+                                    lng: s[1],
+                                    color: '#ffffff',
+                                    age_min: 0
+                                });
+                            }
+                        }
+                        lightningLayer.redraw();
+                        document.getElementById('strikeCount').textContent = strikeStore.size;
                     }
-                } catch (err) {
-                    console.warn('SSE parse error', err);
-                }
+                } catch (err) {}
             });
 
             eventSource.onerror = () => {
@@ -531,7 +476,7 @@ def serve_map():
         reloadArchive();
         connectSSE();
         
-        console.log('🚀 Карта запущена, SSE + периодическое обновление');
+        console.log('🚀 Карта запущена, API:', PROXY_URL);
     </script>
 </body>
 </html>"""
@@ -539,25 +484,21 @@ def serve_map():
 
 @app.route('/lightning-stream')
 def stream():
-    """
-    SSE-поток для пользователей.
-    НЕ подключается к внешнему источнику, а читает из очереди new_strikes_queue,
-    которую заполняет фоновый сборщик.
-    """
     def generate():
-        print("👤 Новый SSE-клиент подключен")
         try:
-            while True:
-                # Ждём новые данные от фонового сборщика
-                data = new_strikes_queue.get(timeout=30)  # Таймаут 30 сек для heartbeat
-                
-                if data:
-                    # Отправляем данные клиенту
-                    yield f"event: lightning-vaisala\ndata: {json.dumps(data)}\n\n"
-                    
+            resp = requests.get(SOURCE_URL, stream=True, timeout=30)
+            if resp.status_code != 200:
+                yield f"event: error\ndata: HTTP {resp.status_code}\n\n"
+                return
+            buffer = ""
+            for chunk in resp.iter_content(chunk_size=256, decode_unicode=True):
+                if chunk:
+                    buffer += chunk
+                    while '\n\n' in buffer:
+                        event, buffer = buffer.split('\n\n', 1)
+                        yield event + '\n\n'
         except Exception as e:
-            print(f"👤 SSE-клиент отключен: {e}")
-            yield f"event: error\ndata: {str(e)}\n\n"
+            yield f"event: error\ndata: {e}\n\n"
     
     return Response(generate(), mimetype='text/event-stream',
                     headers={
@@ -573,7 +514,7 @@ def get_archive():
         for data in lightning_archive.values():
             age_min = (now - data['time']) / 60.0
             
-            if age_min > 60:
+            if age_min > 120:
                 continue
                 
             if age_min <= 10:
@@ -582,12 +523,14 @@ def get_archive():
                 color = '#ffff00'
             elif age_min <= 30:
                 color = '#ffa500'
-            elif age_min <= 40:
-                color = '#ff4500'
             elif age_min <= 50:
+                color = '#ff4500'
+            elif age_min <= 60:
                 color = '#ff0000'
-            else:
+            elif age_min <= 90:
                 color = '#8b0000'
+            else:
+                color = '#4a0000'
                 
             strikes.append({
                 'lat': data['lat'],
@@ -614,9 +557,8 @@ def get_stats():
             '0-10min': 0,
             '10-20min': 0,
             '20-30min': 0,
-            '30-40min': 0,
-            '40-50min': 0,
-            '50-60min': 0
+            '30-60min': 0,
+            '60-120min': 0
         }
         
         for data in lightning_archive.values():
@@ -627,12 +569,10 @@ def get_stats():
                 age_groups['10-20min'] += 1
             elif age_min <= 30:
                 age_groups['20-30min'] += 1
-            elif age_min <= 40:
-                age_groups['30-40min'] += 1
-            elif age_min <= 50:
-                age_groups['40-50min'] += 1
             elif age_min <= 60:
-                age_groups['50-60min'] += 1
+                age_groups['30-60min'] += 1
+            elif age_min <= 120:
+                age_groups['60-120min'] += 1
     
     return jsonify({
         'total_strikes': total,
@@ -643,7 +583,7 @@ def get_stats():
 
 @app.route('/health')
 def health():
-    return jsonify({'status': 'healthy', 'archive_size': len(lightning_archive)}), 200
+    return jsonify({'status': 'healthy'}), 200
 
 # ========== ИНИЦИАЛИЗАЦИЯ ==========
 
@@ -652,23 +592,12 @@ load_archive()
 deletion_thread = Thread(target=periodic_file_deletion, daemon=True)
 deletion_thread.start()
 
-save_thread = Thread(target=periodic_save, daemon=True)
-save_thread.start()
-
 collector_thread = Thread(target=background_lightning_collector, daemon=True)
 collector_thread.start()
 
-keepalive_thread = Thread(target=fake_user_keepalive, daemon=True)
-keepalive_thread.start()
-
 print("\n" + "=" * 70)
 print("⚡ LIGHTNING ARCHIVE API")
-print("📊 Фоновый сборщик: АКТИВЕН (собирает в очередь)")
-print("💾 Автосохранение: каждые 30 сек")
-print("👥 SSE для пользователей: читает из очереди")
-print("🤖 Keepalive: каждые 5 мин")
-print("⏱️ Очистка старых: через 1 час")
-print("🗑️ Полная очистка: каждые 20 минут")
+print("📊 Фоновый сбор: АКТИВЕН")
 print("=" * 70 + "\n")
 
 if __name__ == '__main__':
