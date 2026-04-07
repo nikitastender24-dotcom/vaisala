@@ -8,7 +8,6 @@ from threading import Lock, Thread
 
 app = Flask(__name__)
 
-# Настройка CORS для доступа с любых доменов
 CORS(app, resources={
     r"/*": {
         "origins": "*",
@@ -18,64 +17,27 @@ CORS(app, resources={
 })
 
 SOURCE_URL = "https://tiles.wo-cloud.com/live?channels=lightning-nowcast,lightning-vaisala"
-ARCHIVE_FILE = "lightning_archive.json"
-MAX_AGE_SECONDS = 7200
+MAX_AGE_SECONDS = 7200  # 2 часа
 MAX_POINTS = 80000
-DELETE_FILE_INTERVAL = 3600  # 1 час
+CLEAR_INTERVAL = 1200  # 20 минут
 
 lightning_archive = {}
 lock = Lock()
 collector_running = False
-
-def load_archive():
-    global lightning_archive
-    if not os.path.exists(ARCHIVE_FILE):
-        print("📂 Файл архива не найден, начинаем с пустого")
-        return
-    try:
-        with open(ARCHIVE_FILE, 'r') as f:
-            data = json.load(f)
-        lightning_archive = {}
-        for key, value in data.items():
-            lat, lng = map(float, key.split(','))
-            lightning_archive[(lat, lng)] = value
-        print(f"✅ Загружено {len(lightning_archive)} разрядов из файла")
-    except Exception as e:
-        print(f"❌ Ошибка загрузки: {e}")
-
-def save_archive():
-    try:
-        out = {f"{lat},{lng}": v for (lat, lng), v in lightning_archive.items()}
-        with open(ARCHIVE_FILE, 'w') as f:
-            json.dump(out, f)
-    except Exception as e:
-        print(f"❌ Ошибка сохранения: {e}")
-
-def delete_archive_file():
-    try:
-        if os.path.exists(ARCHIVE_FILE):
-            os.remove(ARCHIVE_FILE)
-            print(f"🗑️ Файл {ARCHIVE_FILE} удален")
-    except Exception as e:
-        print(f"❌ Ошибка удаления файла: {e}")
-
-def periodic_file_deletion():
-    while True:
-        time.sleep(DELETE_FILE_INTERVAL)
-        with lock:
-            delete_archive_file()
-            lightning_archive.clear()
-            print(f"🔄 Архив очищен (каждые {DELETE_FILE_INTERVAL // 60} минут)")
+last_update_time = 0  # Когда последний раз обновлялись данные
 
 def clean_old():
+    """Удаляет точки старше 2 часов"""
     with lock:
         now = time.time()
         to_del = [k for k, v in lightning_archive.items() if now - v['time'] > MAX_AGE_SECONDS]
         for k in to_del:
             del lightning_archive[k]
-        check_limit()
+        if to_del:
+            print(f"🧹 Удалено {len(to_del)} старых точек (>2ч)")
 
 def check_limit():
+    """Если точек больше MAX_POINTS — удаляем самые старые"""
     global lightning_archive
     deleted = 0
     while len(lightning_archive) > MAX_POINTS:
@@ -93,20 +55,36 @@ def check_limit():
             deleted += 1
         else:
             break
+    
+    if deleted > 0:
+        print(f"⚠️ Удалено по лимиту: {deleted} точек")
+
+def periodic_clear():
+    """Полностью очищает память каждые 20 минут"""
+    while True:
+        time.sleep(CLEAR_INTERVAL)
+        with lock:
+            count = len(lightning_archive)
+            lightning_archive.clear()
+            print(f"🔄 ПОЛНАЯ ОЧИСТКА памяти: удалено {count} точек (каждые {CLEAR_INTERVAL // 60} мин)")
 
 def background_lightning_collector():
-    global collector_running
+    """
+    ЕДИНСТВЕННЫЙ фоновый поток, который собирает данные.
+    Работает ВСЕГДА, независимо от того, есть ли пользователи на сайте.
+    """
+    global collector_running, last_update_time
     collector_running = True
     
     print("=" * 70)
-    print("🔥 ФОНОВЫЙ СБОРЩИК МОЛНИЙ ЗАПУЩЕН")
+    print("🔥 ФОНОВЫЙ СБОРЩИК МОЛНИЙ ЗАПУЩЕН (работает постоянно)")
     print("=" * 70)
     
     reconnect_delay = 5
     
     while collector_running:
         try:
-            print(f"\n📡 Подключение к источнику...")
+            print(f"\n📡 Подключение к источнику данных...")
             
             resp = requests.get(SOURCE_URL, stream=True, timeout=60)
             
@@ -115,11 +93,10 @@ def background_lightning_collector():
                 time.sleep(reconnect_delay)
                 continue
             
-            print("✅ ПОДКЛЮЧЕНО!")
-            print(f"📊 Текущий архив: {len(lightning_archive)} разрядов")
+            print("✅ ПОДКЛЮЧЕНО К ИСТОЧНИКУ!")
+            print(f"📊 Текущий архив в RAM: {len(lightning_archive)} разрядов")
             
             buffer = ""
-            last_save = time.time()
             last_clean = time.time()
             last_heartbeat = time.time()
             
@@ -128,10 +105,11 @@ def background_lightning_collector():
                     break
                 
                 buffer += chunk
-                
                 now = time.time()
+                
+                # Heartbeat каждые 60 секунд
                 if now - last_heartbeat > 60:
-                    print(f"💓 Активно | Архив: {len(lightning_archive)}")
+                    print(f"💓 Соединение активно | В RAM: {len(lightning_archive)} точек")
                     last_heartbeat = now
                 
                 while '\n\n' in buffer:
@@ -173,23 +151,21 @@ def background_lightning_collector():
                                             }
                                     
                                     check_limit()
+                                    last_update_time = now_ts  # Обновляем время последнего обновления
                                 
                                 if new_strikes > 0:
-                                    print(f"⚡ +{new_strikes} | Всего: {len(lightning_archive)}")
-                                
-                                if now_ts - last_save > 10:
-                                    save_archive()
-                                    last_save = now_ts
+                                    print(f"⚡ +{new_strikes} новых | Всего в RAM: {len(lightning_archive)}")
                                     
                         except Exception as e:
-                            print(f"❌ Ошибка обработки: {e}")
+                            pass  # Игнорируем ошибки парсинга
                     
-                    if now - last_clean > 60:
-                        clean_old()
-                        last_clean = now
+                # Очистка старых каждые 60 секунд
+                if now - last_clean > 60:
+                    clean_old()
+                    last_clean = now
                         
         except Exception as e:
-            print(f"❌ Ошибка: {e}")
+            print(f"❌ Ошибка подключения: {e}")
             time.sleep(reconnect_delay)
 
 # ========== РОУТЫ ==========
@@ -430,43 +406,11 @@ def serve_map():
             document.getElementById('statusText').textContent = 'Сброс выполнен';
         }
 
-        let eventSource = null;
-        function connectSSE() {
-            if (eventSource) eventSource.close();
-            eventSource = new EventSource(PROXY_URL + '/lightning-stream');
-
-            eventSource.addEventListener('lightning-vaisala', (e) => {
-                try {
-                    const data = JSON.parse(e.data);
-                    if (data && data.lightning) {
-                        for (const s of data.lightning) {
-                            if (s.length >= 2) {
-                                const key = `${s[0].toFixed(4)},${s[1].toFixed(4)}`;
-                                strikeStore.set(key, {
-                                    lat: s[0],
-                                    lng: s[1],
-                                    color: '#ffffff',
-                                    age_min: 0
-                                });
-                            }
-                        }
-                        lightningLayer.redraw();
-                        document.getElementById('strikeCount').textContent = strikeStore.size;
-                    }
-                } catch (err) {}
-            });
-
-            eventSource.onerror = () => {
-                console.log('SSE error, reconnecting...');
-                if (eventSource) eventSource.close();
-                setTimeout(connectSSE, 5000);
-            };
-        }
-
         document.getElementById('refreshBtn').onclick = reloadArchive;
         document.getElementById('clearBtn').onclick = clearAllMarkers;
 
-        setInterval(reloadArchive, 30000);
+        // ГЛАВНОЕ: Обновляем данные каждые 10 секунд (просто читаем из /api/archive)
+        setInterval(reloadArchive, 10000);
 
         window.addEventListener('resize', () => {
             map.invalidateSize();
@@ -474,40 +418,16 @@ def serve_map():
         });
 
         reloadArchive();
-        connectSSE();
         
-        console.log('🚀 Карта запущена, API:', PROXY_URL);
+        console.log('🚀 Карта запущена, автообновление каждые 10 сек');
     </script>
 </body>
 </html>"""
     return html
 
-@app.route('/lightning-stream')
-def stream():
-    def generate():
-        try:
-            resp = requests.get(SOURCE_URL, stream=True, timeout=30)
-            if resp.status_code != 200:
-                yield f"event: error\ndata: HTTP {resp.status_code}\n\n"
-                return
-            buffer = ""
-            for chunk in resp.iter_content(chunk_size=256, decode_unicode=True):
-                if chunk:
-                    buffer += chunk
-                    while '\n\n' in buffer:
-                        event, buffer = buffer.split('\n\n', 1)
-                        yield event + '\n\n'
-        except Exception as e:
-            yield f"event: error\ndata: {e}\n\n"
-    
-    return Response(generate(), mimetype='text/event-stream',
-                    headers={
-                        'Cache-Control': 'no-cache',
-                        'X-Accel-Buffering': 'no'
-                    })
-
 @app.route('/api/archive')
 def get_archive():
+    """Пользователи просто читают данные из RAM"""
     with lock:
         now = time.time()
         strikes = []
@@ -545,7 +465,6 @@ def get_archive():
 def clear_archive():
     with lock:
         lightning_archive.clear()
-        delete_archive_file()
     return jsonify({'status': 'cleared', 'count': 0})
 
 @app.route('/api/stats')
@@ -577,27 +496,32 @@ def get_stats():
     return jsonify({
         'total_strikes': total,
         'age_distribution': age_groups,
-        'file_exists': os.path.exists(ARCHIVE_FILE),
-        'collector_running': collector_running
+        'collector_running': collector_running,
+        'last_update': last_update_time
     })
 
 @app.route('/health')
 def health():
-    return jsonify({'status': 'healthy'}), 200
+    return jsonify({
+        'status': 'healthy', 
+        'archive_size': len(lightning_archive),
+        'collector_running': collector_running
+    }), 200
 
 # ========== ИНИЦИАЛИЗАЦИЯ ==========
 
-load_archive()
-
-deletion_thread = Thread(target=periodic_file_deletion, daemon=True)
-deletion_thread.start()
+# Запуск фоновых потоков
+clear_thread = Thread(target=periodic_clear, daemon=True)
+clear_thread.start()
 
 collector_thread = Thread(target=background_lightning_collector, daemon=True)
 collector_thread.start()
 
 print("\n" + "=" * 70)
 print("⚡ LIGHTNING ARCHIVE API")
-print("📊 Фоновый сбор: АКТИВЕН")
+print("📊 Фоновый сборщик работает ВСЕГДА (независимо от пользователей)")
+print("🗑️ Автоочистка каждые 20 минут")
+print("👥 Пользователи читают данные из RAM через /api/archive")
 print("=" * 70 + "\n")
 
 if __name__ == '__main__':
