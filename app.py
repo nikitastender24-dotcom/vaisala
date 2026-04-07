@@ -1,3 +1,4 @@
+# ----------------------------------------------------------------------
 #  app.py  –  один файл, который делает всё, что вы просили
 # ----------------------------------------------------------------------
 import os
@@ -5,10 +6,12 @@ import time
 import json
 import socket
 import threading
-from datetime import datetimefrom threading import Lock
+from datetime import datetime
+from threading import Lock
 
 import requests
-from flask import Flask, Response, jsonify, send_filefrom flask_cors import CORS
+from flask import Flask, Response, jsonify, request
+from flask_cors import CORS
 
 # --------------------------  НАСТРОЙКИ  ---------------------------
 SOURCE_URL = "https://tiles.wo-cloud.com/live?channels=lightning-nowcast,lightning-vaisala"
