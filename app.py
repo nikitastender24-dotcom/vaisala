@@ -18,9 +18,10 @@ CORS(app, resources={
 
 SOURCE_URL = "https://tiles.wo-cloud.com/live?channels=lightning-nowcast,lightning-vaisala"
 ARCHIVE_FILE = "lightning_archive.json"
-MAX_AGE_SECONDS = 3600  # 1 час (было 7200)
+MAX_AGE_SECONDS = 3600  # 1 час
 MAX_POINTS = 80000
 DELETE_FILE_INTERVAL = 1200  # 20 минут
+SAVE_INTERVAL = 30  # Сохранять каждые 30 секунд
 
 lightning_archive = {}
 lock = Lock()
@@ -44,7 +45,8 @@ def load_archive():
 
 def save_archive():
     try:
-        out = {f"{lat},{lng}": v for (lat, lng), v in lightning_archive.items()}
+        with lock:
+            out = {f"{lat},{lng}": v for (lat, lng), v in lightning_archive.items()}
         with open(ARCHIVE_FILE, 'w') as f:
             json.dump(out, f)
     except Exception as e:
@@ -67,6 +69,13 @@ def periodic_file_deletion():
             delete_archive_file()
             lightning_archive.clear()
             print(f"🔄 Полная очистка: удалено {count} разрядов (каждые {DELETE_FILE_INTERVAL // 60} мин)")
+
+def periodic_save():
+    """Периодическое сохранение в файл"""
+    while True:
+        time.sleep(SAVE_INTERVAL)
+        save_archive()
+        print(f"💾 Автосохранение: {len(lightning_archive)} точек")
 
 def clean_old():
     """Удаляет точки старше 1 часа"""
@@ -104,7 +113,7 @@ def check_limit():
         print(f"⚠️ Удалено по лимиту: {deleted} точек")
 
 def background_lightning_collector():
-    """Фоновый сборщик молний"""
+    """ЕДИНСТВЕННЫЙ сборщик — работает постоянно в фоне"""
     global collector_running
     collector_running = True
     
@@ -129,7 +138,6 @@ def background_lightning_collector():
             print(f"📊 Текущий архив: {len(lightning_archive)} разрядов")
             
             buffer = ""
-            last_save = time.time()
             last_clean = time.time()
             last_heartbeat = time.time()
             
@@ -169,8 +177,8 @@ def background_lightning_collector():
                                 
                                 with lock:
                                     for s in strikes:
-                                        if len(s) >= 2:
-                                            lat, lng = s[0], s[1]
+                                        if isinstance(s, list) and len(s) >= 2:
+                                            lat, lng = float(s[0]), float(s[1])
                                             key = (lat, lng)
                                             
                                             if key not in lightning_archive:
@@ -186,13 +194,9 @@ def background_lightning_collector():
                                 
                                 if new_strikes > 0:
                                     print(f"⚡ +{new_strikes} | Всего: {len(lightning_archive)}")
-                                
-                                if now_ts - last_save > 10:
-                                    save_archive()
-                                    last_save = now_ts
                                     
                         except Exception as e:
-                            pass  # Игнорируем ошибки парсинга
+                            pass
                     
                 # Очистка старых каждые 60 секунд
                 if now - last_clean > 60:
@@ -204,18 +208,11 @@ def background_lightning_collector():
             time.sleep(reconnect_delay)
 
 def fake_user_keepalive():
-    """
-    Фейковый пользователь, который каждые 5 минут делает запрос к /api/archive
-    чтобы сервер не засыпал на бесплатном тарифе Render
-    """
-    print("=" * 70)
-    print("🤖 ФЕЙКОВЫЙ ПОЛЬЗОВАТЕЛЬ ЗАПУЩЕН (keepalive)")
-    print("=" * 70)
-    
+    """Keepalive бот"""
+    print("🤖 Keepalive бот запущен")
     while True:
         try:
             time.sleep(300)  # 5 минут
-            # Делаем внутренний запрос (не через HTTP, а напрямую)
             with lock:
                 count = len(lightning_archive)
             print(f"🤖 Keepalive: в памяти {count} точек")
@@ -432,7 +429,7 @@ def serve_map():
                 const resp = await fetch(PROXY_URL + '/api/archive');
                 const data = await resp.json();
 
-                strikeStore.clear();
+                // НЕ ОЧИЩАЕМstrikeStore полностью, а обновляем
                 for (const s of data.strikes) {
                     const key = `${s.lat.toFixed(4)},${s.lng.toFixed(4)}`;
                     strikeStore.set(key, {
@@ -441,6 +438,14 @@ def serve_map():
                         color: s.color,
                         age_min: s.age_min
                     });
+                }
+
+                // Удаляем только те, которых нет в новых данных
+                const newKeys = new Set(data.strikes.map(s => `${s.lat.toFixed(4)},${s.lng.toFixed(4)}`));
+                for (const key of strikeStore.keys()) {
+                    if (!newKeys.has(key)) {
+                        strikeStore.delete(key);
+                    }
                 }
 
                 document.getElementById('strikeCount').textContent = strikeStore.size;
@@ -459,43 +464,11 @@ def serve_map():
             document.getElementById('statusText').textContent = 'Сброс выполнен';
         }
 
-        let eventSource = null;
-        function connectSSE() {
-            if (eventSource) eventSource.close();
-            eventSource = new EventSource(PROXY_URL + '/lightning-stream');
-
-            eventSource.addEventListener('lightning-vaisala', (e) => {
-                try {
-                    const data = JSON.parse(e.data);
-                    if (data && data.lightning) {
-                        for (const s of data.lightning) {
-                            if (s.length >= 2) {
-                                const key = `${s[0].toFixed(4)},${s[1].toFixed(4)}`;
-                                strikeStore.set(key, {
-                                    lat: s[0],
-                                    lng: s[1],
-                                    color: '#ffffff',
-                                    age_min: 0
-                                });
-                            }
-                        }
-                        lightningLayer.redraw();
-                        document.getElementById('strikeCount').textContent = strikeStore.size;
-                    }
-                } catch (err) {}
-            });
-
-            eventSource.onerror = () => {
-                console.log('SSE error, reconnecting...');
-                if (eventSource) eventSource.close();
-                setTimeout(connectSSE, 5000);
-            };
-        }
-
         document.getElementById('refreshBtn').onclick = reloadArchive;
         document.getElementById('clearBtn').onclick = clearAllMarkers;
 
-        setInterval(reloadArchive, 30000);
+        // Обновляем каждые 15 секунд (ЧАЩЕ = быстрее видим новые метки)
+        setInterval(reloadArchive, 15000);
 
         window.addEventListener('resize', () => {
             map.invalidateSize();
@@ -503,37 +476,12 @@ def serve_map():
         });
 
         reloadArchive();
-        connectSSE();
         
-        console.log('🚀 Карта запущена, API:', PROXY_URL);
+        console.log('🚀 Карта запущена, автообновление каждые 15 сек');
     </script>
 </body>
 </html>"""
     return html
-
-@app.route('/lightning-stream')
-def stream():
-    def generate():
-        try:
-            resp = requests.get(SOURCE_URL, stream=True, timeout=30)
-            if resp.status_code != 200:
-                yield f"event: error\ndata: HTTP {resp.status_code}\n\n"
-                return
-            buffer = ""
-            for chunk in resp.iter_content(chunk_size=256, decode_unicode=True):
-                if chunk:
-                    buffer += chunk
-                    while '\n\n' in buffer:
-                        event, buffer = buffer.split('\n\n', 1)
-                        yield event + '\n\n'
-        except Exception as e:
-            yield f"event: error\ndata: {e}\n\n"
-    
-    return Response(generate(), mimetype='text/event-stream',
-                    headers={
-                        'Cache-Control': 'no-cache',
-                        'X-Accel-Buffering': 'no'
-                    })
 
 @app.route('/api/archive')
 def get_archive():
@@ -623,18 +571,21 @@ load_archive()
 deletion_thread = Thread(target=periodic_file_deletion, daemon=True)
 deletion_thread.start()
 
+save_thread = Thread(target=periodic_save, daemon=True)
+save_thread.start()
+
 collector_thread = Thread(target=background_lightning_collector, daemon=True)
 collector_thread.start()
 
-# НОВОЕ: Фейковый пользователь для keepalive
 keepalive_thread = Thread(target=fake_user_keepalive, daemon=True)
 keepalive_thread.start()
 
 print("\n" + "=" * 70)
 print("⚡ LIGHTNING ARCHIVE API")
-print("📊 Фоновый сбор: АКТИВЕН")
-print("🤖 Keepalive бот: АКТИВЕН (каждые 5 мин)")
-print("⏱️ Очистка старых меток: через 1 час")
+print("📊 Фоновый сборщик: АКТИВЕН")
+print("💾 Автосохранение: каждые 30 сек")
+print("🤖 Keepalive: каждые 5 мин")
+print("⏱️ Очистка старых: через 1 час")
 print("🗑️ Полная очистка: каждые 20 минут")
 print("=" * 70 + "\n")
 
