@@ -20,8 +20,8 @@ CORS(app, resources={
 SOURCE_URL = "https://tiles.wo-cloud.com/live?channels=lightning-nowcast,lightning-vaisala"
 ARCHIVE_FILE = "lightning_archive.json"
 MAX_AGE_SECONDS = 7200
-MAX_POINTS = 80000
-DELETE_FILE_INTERVAL = 3600  # 1 час
+MAX_POINTS = 300000
+DELETE_FILE_INTERVAL = 4200  # 1 час
 
 lightning_archive = {}
 lock = Lock()
