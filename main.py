@@ -19,9 +19,8 @@ CORS(app, resources={
 
 SOURCE_URL = "https://tiles.wo-cloud.com/live?channels=lightning-nowcast,lightning-vaisala"
 ARCHIVE_FILE = "lightning_archive.json"
-MAX_AGE_SECONDS = 7200
-MAX_POINTS = 300000
-DELETE_FILE_INTERVAL = 4200  # 1 час
+MAX_AGE_SECONDS = 7200        # 2 часа
+MAX_POINTS = 300000           # максимум 300 тысяч разрядов
 
 lightning_archive = {}
 lock = Lock()
@@ -51,31 +50,17 @@ def save_archive():
     except Exception as e:
         print(f"❌ Ошибка сохранения: {e}")
 
-def delete_archive_file():
-    try:
-        if os.path.exists(ARCHIVE_FILE):
-            os.remove(ARCHIVE_FILE)
-            print(f"🗑️ Файл {ARCHIVE_FILE} удален")
-    except Exception as e:
-        print(f"❌ Ошибка удаления файла: {e}")
-
-def periodic_file_deletion():
-    while True:
-        time.sleep(DELETE_FILE_INTERVAL)
-        with lock:
-            delete_archive_file()
-            lightning_archive.clear()
-            print(f"🔄 Архив очищен (каждые {DELETE_FILE_INTERVAL // 60} минут)")
-
 def clean_old():
+    """Удаление разрядов старше MAX_AGE_SECONDS"""
     with lock:
         now = time.time()
         to_del = [k for k, v in lightning_archive.items() if now - v['time'] > MAX_AGE_SECONDS]
         for k in to_del:
             del lightning_archive[k]
-        check_limit()
+        check_limit()   # также проверяем лимит количества
 
 def check_limit():
+    """Удаление самых старых записей при превышении MAX_POINTS"""
     global lightning_archive
     deleted = 0
     while len(lightning_archive) > MAX_POINTS:
@@ -93,6 +78,8 @@ def check_limit():
             deleted += 1
         else:
             break
+    if deleted > 0:
+        print(f"🗑️ Удалено {deleted} самых старых записей (превышен лимит {MAX_POINTS})")
 
 def background_lightning_collector():
     global collector_running
@@ -172,7 +159,7 @@ def background_lightning_collector():
                                                 'lng': lng
                                             }
                                     
-                                    check_limit()
+                                    check_limit()   # если превысили 300k, удаляем старые
                                 
                                 if new_strikes > 0:
                                     print(f"⚡ +{new_strikes} | Всего: {len(lightning_archive)}")
@@ -545,7 +532,9 @@ def get_archive():
 def clear_archive():
     with lock:
         lightning_archive.clear()
-        delete_archive_file()
+        # Удаляем файл, если он существует (опционально, можно оставить)
+        if os.path.exists(ARCHIVE_FILE):
+            os.remove(ARCHIVE_FILE)
     return jsonify({'status': 'cleared', 'count': 0})
 
 @app.route('/api/stats')
@@ -589,15 +578,15 @@ def health():
 
 load_archive()
 
-deletion_thread = Thread(target=periodic_file_deletion, daemon=True)
-deletion_thread.start()
-
+# Запускаем только фоновый сборщик
 collector_thread = Thread(target=background_lightning_collector, daemon=True)
 collector_thread.start()
 
 print("\n" + "=" * 70)
 print("⚡ LIGHTNING ARCHIVE API")
 print("📊 Фоновый сбор: АКТИВЕН")
+print(f"📁 Архив: {ARCHIVE_FILE}")
+print(f"📌 Лимит: {MAX_POINTS} записей, удаление старше {MAX_AGE_SECONDS // 3600} часов")
 print("=" * 70 + "\n")
 
 if __name__ == '__main__':
